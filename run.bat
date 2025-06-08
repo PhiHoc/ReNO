@@ -1,4 +1,4 @@
-py main.py ^
+python main.py ^
     --task bear_dataset ^
     --model sdxl-turbo ^
     --save_dir ./outputs_bears ^

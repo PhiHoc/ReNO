@@ -107,6 +107,9 @@ def main(args):
     else:
         multi_apply_fn = None
 
+    total_best_rewards = None
+    total_init_rewards = None
+
     if args.task == "single":
         init_latents = torch.randn(shape, device=device, dtype=dtype)
         latents = torch.nn.Parameter(init_latents, requires_grad=enable_grad)
