@@ -250,37 +250,37 @@ def main(args):
                 f"Mean initial all rewards: {total_init_rewards}\n"
                 f"Mean best all rewards: {total_best_rewards}"
             )
-    elif args.task == "geneval":
-        prompt_list_file = "../geneval/prompts/evaluation_metadata.jsonl"
-        with open(prompt_list_file) as fp:
-            metadatas = [json.loads(line) for line in fp]
-        outdir = f"{args.save_dir}/{args.task}/{settings}"
-        for index, metadata in enumerate(metadatas):
-            # Get new latents and optimizer
-            init_latents = torch.randn(shape, device=device, dtype=dtype)
-            latents = torch.nn.Parameter(init_latents, requires_grad=True)
-            optimizer = get_optimizer(args.optim, latents, args.lr, args.nesterov)
-
-            prompt = metadata["prompt"]
-            init_image, best_image, init_rewards, best_rewards = trainer.train(
-                latents, prompt, optimizer, None, multi_apply_fn
-            )
-            logging.info(f"Initial rewards: {init_rewards}")
-            logging.info(f"Best rewards: {best_rewards}")
-            outpath = f"{outdir}/{index:0>5}"
-            os.makedirs(f"{outpath}/samples", exist_ok=True)
-            with open(f"{outpath}/metadata.jsonl", "w") as fp:
-                json.dump(metadata, fp)
-            best_image.save(f"{outpath}/samples/{args.seed:05}.png")
-            if i == 0:
-                total_best_rewards = {k: 0.0 for k in best_rewards.keys()}
-                total_init_rewards = {k: 0.0 for k in best_rewards.keys()}
-            for k in best_rewards.keys():
-                total_best_rewards[k] += best_rewards[k]
-                total_init_rewards[k] += init_rewards[k]
-        for k in total_best_rewards.keys():
-            total_best_rewards[k] /= len(parti_dataset)
-            total_init_rewards[k] /= len(parti_dataset)
+    # elif args.task == "geneval":
+    #     prompt_list_file = "../geneval/prompts/evaluation_metadata.jsonl"
+    #     with open(prompt_list_file) as fp:
+    #         metadatas = [json.loads(line) for line in fp]
+    #     outdir = f"{args.save_dir}/{args.task}/{settings}"
+    #     for index, metadata in enumerate(metadatas):
+    #         # Get new latents and optimizer
+    #         init_latents = torch.randn(shape, device=device, dtype=dtype)
+    #         latents = torch.nn.Parameter(init_latents, requires_grad=True)
+    #         optimizer = get_optimizer(args.optim, latents, args.lr, args.nesterov)
+    #
+    #         prompt = metadata["prompt"]
+    #         init_image, best_image, init_rewards, best_rewards = trainer.train(
+    #             latents, prompt, optimizer, None, multi_apply_fn
+    #         )
+    #         logging.info(f"Initial rewards: {init_rewards}")
+    #         logging.info(f"Best rewards: {best_rewards}")
+    #         outpath = f"{outdir}/{index:0>5}"
+    #         os.makedirs(f"{outpath}/samples", exist_ok=True)
+    #         with open(f"{outpath}/metadata.jsonl", "w") as fp:
+    #             json.dump(metadata, fp)
+    #         best_image.save(f"{outpath}/samples/{args.seed:05}.png")
+    #         if i == 0:
+    #             total_best_rewards = {k: 0.0 for k in best_rewards.keys()}
+    #             total_init_rewards = {k: 0.0 for k in best_rewards.keys()}
+    #         for k in best_rewards.keys():
+    #             total_best_rewards[k] += best_rewards[k]
+    #             total_init_rewards[k] += init_rewards[k]
+    #     for k in total_best_rewards.keys():
+    #         total_best_rewards[k] /= len(parti_dataset)
+    #         total_init_rewards[k] /= len(parti_dataset)
 
 
 
