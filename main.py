@@ -337,6 +337,13 @@ def main(args):
 
             os.makedirs(class_save_dir, exist_ok=True)
 
+            expected_filename = f"{i:04d}_000.png"
+            expected_filepath = os.path.join(class_save_dir, expected_filename)
+
+            if os.path.exists(expected_filepath):
+                logging.info(f"Output for prompt {i} already exists. Skipping.")
+                continue  # Bỏ qua prompt này và đi đến prompt tiếp theo
+
             # Vòng lặp để tạo ra số lượng ảnh mong muốn cho mỗi prompt
 
             for j in range(args.num_images_per_prompt):
