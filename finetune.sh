@@ -1,0 +1,10 @@
+!accelerate launch finetune_one_step_lora.py \
+  --pretrained_model_name_or_path="stabilityai/sdxl-turbo" \
+  --train_data_dir="./data/my_bears" \
+  --output_dir="./lora_weights/sdxl_turbo_bear_dynamic_lora" \
+  --resolution=512 \
+  --train_batch_size=1 \
+  --gradient_accumulation_steps=4 \
+  --learning_rate=1e-4 \
+  --max_train_steps=1000 \
+  --use_8bit_adam
