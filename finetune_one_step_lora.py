@@ -212,7 +212,7 @@ def main():
             #                                       rank=args.lora_rank)
 
             lora_attn_procs[name] = LoRAAttnProcessor(
-                rank=args.lora_rank
+                r=args.lora_rank
             )
 
     unet.set_attn_processor(lora_attn_procs)
