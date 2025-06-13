@@ -25,7 +25,6 @@ from torchvision import transforms
 from tqdm.auto import tqdm
 from transformers import CLIPTextModel, CLIPTextModelWithProjection, CLIPTokenizer
 
-# --- Bắt đầu: Thêm các lớp LoRA cần thiết ---
 # Code được lấy từ diffusers==0.21.4 để đảm bảo tương thích
 # Nguồn: https://github.com/huggingface/diffusers/blob/v0.21.4/src/diffusers/models/attention_processor.py
 
@@ -102,9 +101,6 @@ class LoRAAttnProcessor(nn.Module):
         hidden_states = attn.to_out[1](hidden_states)
 
         return hidden_states
-
-# --- Kết thúc: Thêm các lớp LoRA cần thiết ---
-
 
 IMAGENET_TEMPLATES_TINY = [
     "a photo of a {}.",
@@ -391,31 +387,37 @@ def main():
                 noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
 
                 # Lấy text embeddings
-                prompt_ids = tokenizer(batch["prompts"], padding="max_length", max_length=tokenizer.model_max_length, truncation=True,
-                                       return_tensors="pt").input_ids.to(accelerator.device)
+                prompt_ids = tokenizer(
+                    batch["prompts"], padding="max_length", max_length=tokenizer.model_max_length, truncation=True, return_tensors="pt"
+                ).input_ids.to(accelerator.device)
 
-                prompt_ids_2 = tokenizer_2(batch["prompts"], padding="max_length", max_length=tokenizer_2.model_max_length, truncation=True,
-                                        return_tensors="pt").input_ids.to(accelerator.device)
+                prompt_ids_2 = tokenizer_2(
+                    batch["prompts"], padding="max_length", max_length=tokenizer_2.model_max_length, truncation=True, return_tensors="pt"
+                ).input_ids.to(accelerator.device)
 
-                # SDXL-Turbo và Hyper-SD dùng 2 text encoder
-                encoder_hidden_states = text_encoder(prompt_ids, return_dict=False)[0]
+                # --- SỬA LỖI LOGIC TẠO EMBEDDING CHO SDXL (Bản hoàn chỉnh) ---
                 
-                # Cần xử lý text embeddings cho SDXL
-                add_text_embeds = text_encoder_2(prompt_ids_2, return_dict=False)[0]
+                # 1. Lấy hidden_states (3D) từ cả hai text encoder.
+                prompt_embeds_1 = text_encoder(prompt_ids, return_dict=True)
                 
-                # Lấy pooled_prompt_embeds từ text_encoder_2
-                # SDXL-Turbo sử dụng output thứ hai của text_encoder_2
-                pooled_prompt_embeds = text_encoder_2(prompt_ids_2, output_hidden_states=True, return_dict=False)[1]
+                text_encoder_2_output = text_encoder_2(prompt_ids_2, return_dict=True)
+                prompt_embeds_2 = text_encoder_2_output.last_hidden_state
+                
+                # 2. Ghép (concatenate) hidden_states từ cả hai encoder lại với nhau dọc theo chiều cuối cùng.
+                # Shape sẽ từ (batch, 77, 768) và (batch, 77, 1280) -> (batch, 77, 2048)
+                encoder_hidden_states = torch.cat([prompt_embeds_1.last_hidden_state, prompt_embeds_2], dim=-1)
+                
+                # 3. Lấy pooled_prompt_embeds (2D) từ text encoder thứ hai.
+                pooled_prompt_embeds = text_encoder_2_output.text_embeds
 
-
+                # 4. Chuẩn bị các conditioning signals bổ sung.
                 add_time_ids = torch.tensor(
                     [[args.resolution, args.resolution, 0, 0, args.resolution, args.resolution]],
-                    device=accelerator.device, dtype=encoder_hidden_states.dtype).repeat(bsz, 1)
+                    device=accelerator.device, dtype=encoder_hidden_states.dtype
+                ).repeat(bsz, 1)
 
                 added_cond_kwargs = {"text_embeds": pooled_prompt_embeds, "time_ids": add_time_ids}
-                
-                # Kết hợp encoder_hidden_states
-                encoder_hidden_states = torch.cat([encoder_hidden_states, add_text_embeds], dim=-1)
+                # --- KẾT THÚC SỬA LỖI ---
 
                 # Dự đoán nhiễu
                 model_pred = unet(noisy_latents, timesteps, encoder_hidden_states,
@@ -444,9 +446,21 @@ def main():
     # --- Lưu LoRA weight ---
     accelerator.wait_for_everyone()
     if accelerator.is_main_process:
-        unet = unet.to(torch.float32)
-        unet.save_attn_procs(args.output_dir)
-        logger.info(f"LoRA weights saved to {args.output_dir}")
+        # Lấy state_dict từ các lora_layers đã được huấn luyện một cách an toàn
+        # Accelerator sẽ tự động gom các trọng số từ tất cả các tiến trình (nếu có)
+        lora_state_dict = accelerator.get_state_dict(lora_layers)
+
+        # Tạo thư mục output nếu chưa tồn tại
+        output_dir = Path(args.output_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Thêm import cần thiết để lưu file
+        from safetensors.torch import save_file
+
+        # Lưu trọng số LoRA ra file, đây là định dạng tiêu chuẩn
+        save_file(lora_state_dict, output_dir / "pytorch_lora_weights.safetensors")
+
+        logger.info(f"LoRA weights saved successfully to {output_dir / 'pytorch_lora_weights.safetensors'}")
 
 
 if __name__ == "__main__":
