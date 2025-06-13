@@ -286,18 +286,23 @@ def main():
     logger.info("Injecting LoRA into UNet...")
     lora_attn_procs = {}
     for name in unet.attn_processors.keys():
-        # Bỏ comment và sử dụng logic cũ để đảm bảo tương thích
         cross_attention_dim = None if name.endswith("attn1.processor") else unet.config.cross_attention_dim
-        if name.startswith("mid_block"):
-            hidden_size = unet.config.block_out_channels[-1]
-        elif name.startswith("up_blocks"):
-            block_id = int(name[len("up_blocks."):])
-            hidden_size = list(reversed(unet.config.block_out_channels))[block_id]
-        elif name.startswith("down_blocks"):
-            block_id = int(name[len("down_blocks."):])
-            hidden_size = unet.config.block_out_channels[block_id]
-        else:
-            # Bỏ qua nếu không khớp với các block attention mong muốn
+        
+        try:
+            if name.startswith("mid_block"):
+                hidden_size = unet.config.block_out_channels[-1]
+            elif name.startswith("up_blocks"):
+                block_id_str = name[len("up_blocks."):].split(".")[0]
+                block_id = int(block_id_str)
+                hidden_size = list(reversed(unet.config.block_out_channels))[block_id]
+            elif name.startswith("down_blocks"):
+                block_id_str = name[len("down_blocks."):].split(".")[0]
+                block_id = int(block_id_str)
+                hidden_size = unet.config.block_out_channels[block_id]
+            else:
+                continue
+        except (ValueError, IndexError) as e:
+            logger.warning(f"Could not parse hidden_size for {name}. Skipping. Error: {e}")
             continue
 
         lora_attn_procs[name] = LoRAAttnProcessor(
