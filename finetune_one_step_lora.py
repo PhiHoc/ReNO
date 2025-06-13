@@ -183,7 +183,7 @@ class DynamicPromptDataset(torch.utils.data.Dataset):
         self.class_names = []
 
         # Tải đường dẫn ảnh và tên class từ các thư mục con
-        self.class_folders = sorted([d for d in os.scandir(data_root) if d.is_dir()])
+        self.class_folders = sorted([d for d in os.scandir(data_root) if d.is_dir()], key=lambda d: d.name)
         self.class_name_list = [d.name for d in self.class_folders]
 
         for class_dir in self.class_folders:
