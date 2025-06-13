@@ -3,7 +3,10 @@ import logging
 import os
 from pathlib import Path
 import random
+from typing import Optional
+
 import torch
+import torch.nn as nn
 import torch.nn.functional as f
 import torch.utils.checkpoint
 from PIL import Image
@@ -12,12 +15,96 @@ from accelerate.logging import get_logger
 from accelerate.utils import set_seed
 from diffusers import AutoencoderKL, DDPMScheduler, UNet2DConditionModel
 from diffusers.loaders import AttnProcsLayers
-from diffusers.models.attention_processor import LoRAAttnProcessor
+# LoRAAttnProcessor in diffusers>=0.26.0 is a placeholder class.
+# We need to define the old LoRAAttnProcessor here to use it with the script.
+# from diffusers.models.attention_processor import LoRAAttnProcessor, Attention
+from diffusers.models.attention_processor import Attention
 from diffusers.optimization import get_scheduler
 from huggingface_hub import hf_hub_download
 from torchvision import transforms
 from tqdm.auto import tqdm
 from transformers import CLIPTextModel, CLIPTextModelWithProjection, CLIPTokenizer
+
+# --- Bắt đầu: Thêm các lớp LoRA cần thiết ---
+# Code được lấy từ diffusers==0.21.4 để đảm bảo tương thích
+# Nguồn: https://github.com/huggingface/diffusers/blob/v0.21.4/src/diffusers/models/attention_processor.py
+
+class LoRALinearLayer(nn.Module):
+    def __init__(self, in_features, out_features, rank=4, network_alpha=None):
+        super().__init__()
+
+        if rank > min(in_features, out_features):
+            raise ValueError(f"LoRA rank {rank} must be less or equal than {min(in_features, out_features)}")
+
+        self.down = nn.Linear(in_features, rank, bias=False)
+        self.up = nn.Linear(rank, out_features, bias=False)
+        self.network_alpha = network_alpha
+        self.rank = rank
+
+        nn.init.normal_(self.down.weight, std=1 / self.rank)
+        nn.init.zeros_(self.up.weight)
+
+    def forward(self, hidden_states):
+        orig_dtype = hidden_states.dtype
+        dtype = self.down.weight.dtype
+
+        down_hidden_states = self.down(hidden_states.to(dtype))
+        up_hidden_states = self.up(down_hidden_states)
+
+        if self.network_alpha is not None:
+            up_hidden_states *= self.network_alpha / self.rank
+
+        return up_hidden_states.to(orig_dtype)
+
+class LoRAAttnProcessor(nn.Module):
+    r"""
+    Processor for implementing LoRA attention mechanism.
+    """
+
+    def __init__(self, hidden_size, cross_attention_dim=None, rank=4, network_alpha=None):
+        super().__init__()
+
+        self.hidden_size = hidden_size
+        self.cross_attention_dim = cross_attention_dim
+        self.rank = rank
+        self.network_alpha = network_alpha
+
+        self.to_q_lora = LoRALinearLayer(hidden_size, hidden_size, rank, network_alpha)
+        self.to_k_lora = LoRALinearLayer(cross_attention_dim or hidden_size, hidden_size, rank, network_alpha)
+        self.to_v_lora = LoRALinearLayer(cross_attention_dim or hidden_size, hidden_size, rank, network_alpha)
+        self.to_out_lora = LoRALinearLayer(hidden_size, hidden_size, rank, network_alpha)
+
+    def __call__(self, attn: Attention, hidden_states, encoder_hidden_states=None, attention_mask=None):
+        batch_size, sequence_length, _ = hidden_states.shape
+        attention_mask = attn.prepare_attention_mask(attention_mask, sequence_length, batch_size)
+
+        query = attn.to_q(hidden_states) + self.to_q_lora(hidden_states)
+
+        if encoder_hidden_states is None:
+            encoder_hidden_states = hidden_states
+        elif attn.norm_cross:
+            encoder_hidden_states = attn.norm_encoder_hidden_states(encoder_hidden_states)
+
+        key = attn.to_k(encoder_hidden_states) + self.to_k_lora(encoder_hidden_states)
+        value = attn.to_v(encoder_hidden_states) + self.to_v_lora(encoder_hidden_states)
+
+        query = attn.head_to_batch_dim(query)
+        key = attn.head_to_batch_dim(key)
+        value = attn.head_to_batch_dim(value)
+
+        attention_probs = attn.get_attention_scores(query, key, attention_mask)
+        hidden_states = torch.bmm(attention_probs, value)
+        hidden_states = attn.batch_to_head_dim(hidden_states)
+
+        # linear proj
+        hidden_states = attn.to_out[0](hidden_states) + self.to_out_lora(hidden_states)
+        # dropout
+        hidden_states = attn.to_out[1](hidden_states)
+
+        return hidden_states
+
+# --- Kết thúc: Thêm các lớp LoRA cần thiết ---
+
 
 IMAGENET_TEMPLATES_TINY = [
     "a photo of a {}.",
@@ -67,7 +154,8 @@ def parse_args():
         "--output_dir", type=str, default="./lora_weights/dynamic_one_step_lora",
         help="Directory to save the trained LoRA."
     )
-
+    # Thêm num_train_epochs để tránh lỗi khi truy cập args.num_train_epochs
+    parser.add_argument("--num_train_epochs", type=int, default=1)
     parser.add_argument("--resolution", type=int, default=512)
     parser.add_argument("--train_batch_size", type=int, default=1)
     parser.add_argument("--max_train_steps", type=int, default=1000)
@@ -186,6 +274,7 @@ def main():
     vae.requires_grad_(False)
     text_encoder.requires_grad_(False)
     text_encoder_2.requires_grad_(False)
+    unet.requires_grad_(False) # Đóng băng U-Net trước khi cấy LoRA
 
     weight_dtype = torch.float16 if accelerator.mixed_precision == "fp16" else torch.bfloat16
     vae.to(accelerator.device, dtype=weight_dtype)
@@ -197,23 +286,25 @@ def main():
     logger.info("Injecting LoRA into UNet...")
     lora_attn_procs = {}
     for name in unet.attn_processors.keys():
-        # Deprecate
-        # cross_attention_dim = None if name.endswith("attn1.processor") else unet.config.cross_attention_dim
-        # if name.startswith("mid_block"):
-        #     hidden_size = unet.config.block_out_channels[-1]
-        # elif name.startswith("up_blocks"):
-        #     block_id = int(name[len("up_blocks.")])
-        #     hidden_size = list(reversed(unet.config.block_out_channels))[block_id]
-        # elif name.startswith("down_blocks"):
-        #     block_id = int(name[len("down_blocks.")])
-        #     hidden_size = unet.config.block_out_channels[block_id]
+        # Bỏ comment và sử dụng logic cũ để đảm bảo tương thích
+        cross_attention_dim = None if name.endswith("attn1.processor") else unet.config.cross_attention_dim
+        if name.startswith("mid_block"):
+            hidden_size = unet.config.block_out_channels[-1]
+        elif name.startswith("up_blocks"):
+            block_id = int(name[len("up_blocks."):])
+            hidden_size = list(reversed(unet.config.block_out_channels))[block_id]
+        elif name.startswith("down_blocks"):
+            block_id = int(name[len("down_blocks."):])
+            hidden_size = unet.config.block_out_channels[block_id]
+        else:
+            # Bỏ qua nếu không khớp với các block attention mong muốn
+            continue
 
-            # lora_attn_procs[name] = LoRAAttnProcessor(hidden_size=hidden_size, cross_attention_dim=cross_attention_dim,
-            #                                       rank=args.lora_rank)
-
-            lora_attn_procs[name] = LoRAAttnProcessor(
-                rank=args.lora_rank
-            )
+        lora_attn_procs[name] = LoRAAttnProcessor(
+            hidden_size=hidden_size,
+            cross_attention_dim=cross_attention_dim,
+            rank=args.lora_rank
+        )
 
     unet.set_attn_processor(lora_attn_procs)
     lora_layers = AttnProcsLayers(unet.attn_processors)
@@ -261,9 +352,12 @@ def main():
         num_training_steps=args.max_train_steps * args.gradient_accumulation_steps,
     )
 
-    unet, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
-        unet, optimizer, train_dataloader, lr_scheduler
+    lora_layers, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
+        lora_layers, optimizer, train_dataloader, lr_scheduler
     )
+    # unet không cần prepare vì các tham số của nó đã được đóng băng
+    # chỉ lora_layers (chứa các tham số cần huấn luyện) mới cần prepare
+
 
     # --- Bắt đầu vòng lặp huấn luyện ---
     logger.info("***** Running training *****")
@@ -276,7 +370,7 @@ def main():
     progress_bar.set_description("Steps")
 
     for epoch in range(args.num_train_epochs):
-        unet.train()
+        unet.train() # Đặt unet ở chế độ train để các attention processor có thể hoạt động
         for step, batch in enumerate(train_dataloader):
             with accelerator.accumulate(unet):
                 # Chuyển ảnh thành latents
@@ -292,17 +386,31 @@ def main():
                 noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
 
                 # Lấy text embeddings
-                prompt_ids = tokenizer(batch["prompts"], padding="max_length", truncation=True,
+                prompt_ids = tokenizer(batch["prompts"], padding="max_length", max_length=tokenizer.model_max_length, truncation=True,
                                        return_tensors="pt").input_ids.to(accelerator.device)
 
+                prompt_ids_2 = tokenizer_2(batch["prompts"], padding="max_length", max_length=tokenizer_2.model_max_length, truncation=True,
+                                        return_tensors="pt").input_ids.to(accelerator.device)
+
                 # SDXL-Turbo và Hyper-SD dùng 2 text encoder
-                encoder_hidden_states = text_encoder(prompt_ids)[0]
-                prompt_embeds_2 = text_encoder_2(prompt_ids)[0]
-                pooled_prompt_embeds = prompt_embeds_2
+                encoder_hidden_states = text_encoder(prompt_ids, return_dict=False)[0]
+                
+                # Cần xử lý text embeddings cho SDXL
+                add_text_embeds = text_encoder_2(prompt_ids_2, return_dict=False)[0]
+                
+                # Lấy pooled_prompt_embeds từ text_encoder_2
+                # SDXL-Turbo sử dụng output thứ hai của text_encoder_2
+                pooled_prompt_embeds = text_encoder_2(prompt_ids_2, output_hidden_states=True, return_dict=False)[1]
+
+
                 add_time_ids = torch.tensor(
                     [[args.resolution, args.resolution, 0, 0, args.resolution, args.resolution]],
                     device=accelerator.device, dtype=encoder_hidden_states.dtype).repeat(bsz, 1)
+
                 added_cond_kwargs = {"text_embeds": pooled_prompt_embeds, "time_ids": add_time_ids}
+                
+                # Kết hợp encoder_hidden_states
+                encoder_hidden_states = torch.cat([encoder_hidden_states, add_text_embeds], dim=-1)
 
                 # Dự đoán nhiễu
                 model_pred = unet(noisy_latents, timesteps, encoder_hidden_states,
@@ -310,6 +418,8 @@ def main():
                 loss = f.mse_loss(model_pred.float(), noise.float(), reduction="mean")
 
                 accelerator.backward(loss)
+                if accelerator.sync_gradients:
+                    accelerator.clip_grad_norm_(lora_layers.parameters(), 1.0)
                 optimizer.step()
                 lr_scheduler.step()
                 optimizer.zero_grad()
@@ -321,11 +431,15 @@ def main():
 
             if global_step >= args.max_train_steps:
                 break
+        
+        if global_step >= args.max_train_steps:
+                break
+
 
     # --- Lưu LoRA weight ---
     accelerator.wait_for_everyone()
     if accelerator.is_main_process:
-        unet = accelerator.unwrap_model(unet)
+        unet = unet.to(torch.float32)
         unet.save_attn_procs(args.output_dir)
         logger.info(f"LoRA weights saved to {args.output_dir}")
 
