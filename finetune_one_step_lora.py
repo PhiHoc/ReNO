@@ -6,6 +6,7 @@ import random
 from typing import Optional
 from accelerate.utils import set_seed, ProjectConfiguration
 import torch
+import math
 import torch.nn as nn
 import torch.nn.functional as f
 import torch.utils.checkpoint
@@ -151,7 +152,7 @@ def parse_args():
         help="Directory to save the trained LoRA."
     )
     # Thêm num_train_epochs để tránh lỗi khi truy cập args.num_train_epochs
-    parser.add_argument("--num_train_epochs", type=int, default=1)
+    parser.add_argument("--num_train_epochs", type=int, default=100)
     parser.add_argument("--resolution", type=int, default=512)
     parser.add_argument("--train_batch_size", type=int, default=1)
     parser.add_argument("--max_train_steps", type=int, default=1000)
@@ -335,6 +336,10 @@ def main():
         return {"pixel_values": pixel_values.to(memory_format=torch.contiguous_format).float(), "prompts": prompts}
     train_dataloader = torch.utils.data.DataLoader(train_dataset, batch_size=args.train_batch_size, shuffle=True, collate_fn=collate_fn)
 
+    num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
+    # Tính số epoch cần chạy để đạt được max_train_steps
+    num_train_epochs = math.ceil(args.max_train_steps / num_update_steps_per_epoch)
+
     lr_scheduler = get_scheduler(
         args.lr_scheduler,
         optimizer=optimizer,
@@ -346,7 +351,8 @@ def main():
 
     global_step = 0
     first_epoch = 0
-
+    resume_step = 0
+    
     if args.resume_from_checkpoint:
         if args.resume_from_checkpoint != "latest":
             path = os.path.basename(args.resume_from_checkpoint)
@@ -372,18 +378,19 @@ def main():
 
     logger.info("***** Running training *****")
     logger.info(f"  Num examples = {len(train_dataset)}")
-    logger.info(f"  Num Epochs = {args.num_train_epochs}")
+    logger.info(f"  Num Epochs = {num_train_epochs}")
     logger.info(f"  Total optimization steps = {args.max_train_steps}")
     logger.info(f"  Resuming from step {global_step}")
 
     progress_bar = tqdm(range(global_step, args.max_train_steps), disable=not accelerator.is_local_main_process)
     progress_bar.set_description("Steps")
 
-    for epoch in range(first_epoch, args.num_train_epochs):
+    for epoch in range(first_epoch, num_train_epochs):
         unet.train()
         for step, batch in enumerate(train_dataloader):
             # Bỏ qua các step đã train ở epoch hiện tại nếu resume
             if args.resume_from_checkpoint and epoch == first_epoch and step < resume_step:
+                progress_bar.update(1) # Cập nhật progress bar cho các step bị bỏ qua
                 continue
 
             with accelerator.accumulate(unet):
