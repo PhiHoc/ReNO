@@ -7,4 +7,6 @@
   --gradient_accumulation_steps=4 \
   --learning_rate=1e-4 \
   --max_train_steps=1000 \
-  --use_8bit_adam
+  --use_8bit_adam \
+  --checkpointing_steps=500 \
+  --resume_from_checkpoint="latest" 
