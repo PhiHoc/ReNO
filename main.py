@@ -290,7 +290,11 @@ def main(args):
 
     elif args.task == "bear_dataset" or args.task == "turtle_dataset":
 
-        if args.task == "bear_dataset":
+        if args.prompt_file:
+
+            prompt_list_file = args.prompt_file
+
+        elif args.task == "bear_dataset":
 
             prompt_list_file = "bears_structured.jsonl"
 

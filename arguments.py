@@ -156,5 +156,12 @@ def parse_args():
         help="Path to the folder containing the trained LoRA weights (pytorch_lora_weights.safetensors)."
     )
 
+    parser.add_argument(
+        "--prompt_file",
+        type=str,
+        default=None,
+        help="Path to the .jsonl file containing the prompts."
+    )
+
     args = parser.parse_args()
     return args
