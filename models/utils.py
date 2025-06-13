@@ -26,6 +26,7 @@ def get_model(
     cache_dir: str,
     memsave: bool = False,
     enable_sequential_cpu_offload: bool = False,
+    lora_path: Optional[str] = None,
 ):
     logging.info(f"Loading model: {model_name}")
     if model_name == "sd-turbo":
@@ -56,6 +57,11 @@ def get_model(
             pipe.scheduler.config, timestep_spacing="trailing"
         )
         pipe = pipe.to(device, dtype)
+
+    #     Load lora path
+        if lora_path:
+            logging.info(f"Loading LoRA from {lora_path}")
+            pipe.load_lora_weights(lora_path)
     elif model_name == "pixart":
         pipe = RewardPixartPipeline.from_pretrained(
             "PixArt-alpha/PixArt-XL-2-1024-MS",

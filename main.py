@@ -54,7 +54,8 @@ def main(args):
 
     # Get model and noise trainer
     pipe = get_model(
-        args.model, dtype, device, args.cache_dir, args.memsave, args.cpu_offloading
+        args.model, dtype, device, args.cache_dir, args.memsave, args.cpu_offloading,
+        lora_path=args.lora_path
     )
     trainer = LatentNoiseTrainer(
         reward_losses=reward_losses,

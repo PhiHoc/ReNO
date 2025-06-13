@@ -149,5 +149,12 @@ def parse_args():
         "--multi_step_model", type=str, help="Model to use", default="flux"
     )
 
+    parser.add_argument(
+        "--lora_path",
+        type=str,
+        default=None,
+        help="Path to the folder containing the trained LoRA weights (pytorch_lora_weights.safetensors)."
+    )
+
     args = parser.parse_args()
     return args
