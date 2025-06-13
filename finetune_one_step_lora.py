@@ -4,7 +4,7 @@ import os
 from pathlib import Path
 import random
 from typing import Optional
-
+from accelerate.utils import set_seed, ProjectConfiguration
 import torch
 import torch.nn as nn
 import torch.nn.functional as f
@@ -164,6 +164,27 @@ def parse_args():
     parser.add_argument("--gradient_accumulation_steps", type=int, default=1)
     parser.add_argument("--lora_rank", type=int, default=16)
 
+
+    #Load from checkpoint
+    parser.add_argument(
+        "--checkpointing_steps",
+        type=int,
+        default=500,
+        help=(
+            "Save a checkpoint of the training state every X updates. These checkpoints are stores in states separated"
+            " by folders named `checkpoint-{global_step}`. These checkpoints are only suitable for resuming training."
+        ),
+    )
+    parser.add_argument(
+        "--resume_from_checkpoint",
+        type=str,
+        default=None,
+        help=(
+            "Whether to resume training from a checkpoint. Can be either a string containing the path to a"
+            " checkpoint folder, or `latest` to automatically select the last available checkpoint."
+        ),
+    )
+
     args = parser.parse_args()
     return args
 
@@ -218,9 +239,11 @@ def main():
     args = parse_args()
 
     # Thiết lập Accelerator
+    project_config = ProjectConfiguration(project_dir=args.output_dir, logging_dir=os.path.join(args.output_dir, "logs"))
     accelerator = Accelerator(
         gradient_accumulation_steps=args.gradient_accumulation_steps,
         mixed_precision=args.mixed_precision,
+        project_config=project_config,
     )
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
@@ -229,49 +252,39 @@ def main():
     if args.seed is not None:
         set_seed(args.seed)
 
+    # Tạo thư mục output chính
+    if accelerator.is_main_process:
+        os.makedirs(args.output_dir, exist_ok=True)
+
     # --- Tải mô hình One-Step ---
     logger.info(f"Loading one-step model: {args.pretrained_model_name_or_path}")
-
-    # Tải các thành phần của pipeline
     if args.pretrained_model_name_or_path == "stabilityai/sdxl-turbo":
-        # SDXL-Turbo yêu cầu một VAE cụ thể để có kết quả tốt nhất
         vae = AutoencoderKL.from_pretrained("madebyollin/sdxl-vae-fp16-fix", torch_dtype=torch.float16)
         tokenizer = CLIPTokenizer.from_pretrained("stabilityai/sdxl-turbo", subfolder="tokenizer")
         tokenizer_2 = CLIPTokenizer.from_pretrained("stabilityai/sdxl-turbo", subfolder="tokenizer_2")
-        text_encoder = CLIPTextModel.from_pretrained("stabilityai/sdxl-turbo", subfolder="text_encoder",
-                                                     torch_dtype=torch.float16)
-        text_encoder_2 = CLIPTextModelWithProjection.from_pretrained("stabilityai/sdxl-turbo",
-                                                                     subfolder="text_encoder_2",
-                                                                     torch_dtype=torch.float16)
-        unet = UNet2DConditionModel.from_pretrained("stabilityai/sdxl-turbo", subfolder="unet",
-                                                    torch_dtype=torch.float16)
+        text_encoder = CLIPTextModel.from_pretrained("stabilityai/sdxl-turbo", subfolder="text_encoder", torch_dtype=torch.float16)
+        text_encoder_2 = CLIPTextModelWithProjection.from_pretrained("stabilityai/sdxl-turbo", subfolder="text_encoder_2", torch_dtype=torch.float16)
+        unet = UNet2DConditionModel.from_pretrained("stabilityai/sdxl-turbo", subfolder="unet", torch_dtype=torch.float16)
     elif args.pretrained_model_name_or_path == "ByteDance/Hyper-SD":
         base_model = "stabilityai/stable-diffusion-xl-base-1.0"
         repo_name = "ByteDance/Hyper-SD"
         ckpt_name = "Hyper-SDXL-1step-Unet.safetensors"
-
-        # Tải U-Net của Hyper-SD và các thành phần từ model base SDXL
         from safetensors.torch import load_file
         unet = UNet2DConditionModel.from_config(base_model, subfolder="unet")
         unet.load_state_dict(load_file(hf_hub_download(repo_name, ckpt_name)))
-
         vae = AutoencoderKL.from_pretrained(base_model, subfolder="vae", torch_dtype=torch.float16)
         tokenizer = CLIPTokenizer.from_pretrained(base_model, subfolder="tokenizer")
         tokenizer_2 = CLIPTokenizer.from_pretrained(base_model, subfolder="tokenizer_2")
         text_encoder = CLIPTextModel.from_pretrained(base_model, subfolder="text_encoder", torch_dtype=torch.float16)
-        text_encoder_2 = CLIPTextModelWithProjection.from_pretrained(base_model, subfolder="text_encoder_2",
-                                                                     torch_dtype=torch.float16)
+        text_encoder_2 = CLIPTextModelWithProjection.from_pretrained(base_model, subfolder="text_encoder_2", torch_dtype=torch.float16)
     else:
         raise ValueError("Unsupported one-step model specified.")
 
     noise_scheduler = DDPMScheduler.from_pretrained(args.pretrained_model_name_or_path, subfolder="scheduler")
-
-    # Đóng băng các tham số không cần huấn luyện
     vae.requires_grad_(False)
     text_encoder.requires_grad_(False)
     text_encoder_2.requires_grad_(False)
-    unet.requires_grad_(False) # Đóng băng U-Net trước khi cấy LoRA
-
+    unet.requires_grad_(False)
     weight_dtype = torch.float16 if accelerator.mixed_precision == "fp16" else torch.bfloat16
     vae.to(accelerator.device, dtype=weight_dtype)
     text_encoder.to(accelerator.device, dtype=weight_dtype)
@@ -283,7 +296,6 @@ def main():
     lora_attn_procs = {}
     for name in unet.attn_processors.keys():
         cross_attention_dim = None if name.endswith("attn1.processor") else unet.config.cross_attention_dim
-        
         try:
             if name.startswith("mid_block"):
                 hidden_size = unet.config.block_out_channels[-1]
@@ -300,17 +312,10 @@ def main():
         except (ValueError, IndexError) as e:
             logger.warning(f"Could not parse hidden_size for {name}. Skipping. Error: {e}")
             continue
-
-        lora_attn_procs[name] = LoRAAttnProcessor(
-            hidden_size=hidden_size,
-            cross_attention_dim=cross_attention_dim,
-            rank=args.lora_rank
-        )
-
+        lora_attn_procs[name] = LoRAAttnProcessor(hidden_size=hidden_size, cross_attention_dim=cross_attention_dim, rank=args.lora_rank)
     unet.set_attn_processor(lora_attn_procs)
     lora_layers = AttnProcsLayers(unet.attn_processors)
 
-    # --- Chuẩn bị Optimizer ---
     params_to_optimize = lora_layers.parameters()
     if args.use_8bit_adam:
         try:
@@ -320,32 +325,16 @@ def main():
             raise ImportError("Please install bitsandbytes to use 8-bit Adam. `pip install bitsandbytes`")
     else:
         optimizer_cls = torch.optim.AdamW
+    optimizer = optimizer_cls(params_to_optimize, lr=args.learning_rate, betas=(0.9, 0.999), weight_decay=1e-2, eps=1e-08)
 
-    optimizer = optimizer_cls(
-        params_to_optimize,
-        lr=args.learning_rate,
-        betas=(0.9, 0.999),
-        weight_decay=1e-2,
-        eps=1e-08,
-    )
-
-    # --- Chuẩn bị Dataset ---
     logger.info("Preparing dataset...")
-    train_dataset = DynamicPromptDataset(
-        data_root=args.train_data_dir,
-        tokenizer=tokenizer,
-        size=args.resolution)
-
+    train_dataset = DynamicPromptDataset(data_root=args.train_data_dir, tokenizer=tokenizer, tokenizer_2=tokenizer_2, size=args.resolution)
     def collate_fn(examples):
         pixel_values = torch.stack([example["pixel_values"] for example in examples])
         prompts = [example["prompt"] for example in examples]
         return {"pixel_values": pixel_values.to(memory_format=torch.contiguous_format).float(), "prompts": prompts}
+    train_dataloader = torch.utils.data.DataLoader(train_dataset, batch_size=args.train_batch_size, shuffle=True, collate_fn=collate_fn)
 
-    train_dataloader = torch.utils.data.DataLoader(
-        train_dataset, batch_size=args.train_batch_size, shuffle=True, collate_fn=collate_fn
-    )
-
-    # --- Chuẩn bị Scheduler và Accelerator ---
     lr_scheduler = get_scheduler(
         args.lr_scheduler,
         optimizer=optimizer,
@@ -353,77 +342,73 @@ def main():
         num_training_steps=args.max_train_steps * args.gradient_accumulation_steps,
     )
 
-    lora_layers, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
-        lora_layers, optimizer, train_dataloader, lr_scheduler
-    )
-    # unet không cần prepare vì các tham số của nó đã được đóng băng
-    # chỉ lora_layers (chứa các tham số cần huấn luyện) mới cần prepare
+    lora_layers, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(lora_layers, optimizer, train_dataloader, lr_scheduler)
 
+    global_step = 0
+    first_epoch = 0
 
-    # --- Bắt đầu vòng lặp huấn luyện ---
+    if args.resume_from_checkpoint:
+        if args.resume_from_checkpoint != "latest":
+            path = os.path.basename(args.resume_from_checkpoint)
+        else:
+            # Get the most recent checkpoint
+            dirs = os.listdir(args.output_dir)
+            dirs = [d for d in dirs if d.startswith("checkpoint")]
+            dirs = sorted(dirs, key=lambda x: int(x.split("-")[1]))
+            path = dirs[-1] if len(dirs) > 0 else None
+
+        if path is None:
+            accelerator.print(f"Checkpoint '{args.resume_from_checkpoint}' does not exist. Starting a new training run.")
+            args.resume_from_checkpoint = None
+        else:
+            accelerator.print(f"Resuming from checkpoint {path}")
+            accelerator.load_state(os.path.join(args.output_dir, path))
+            # Cập nhật global_step từ tên thư mục checkpoint
+            global_step = int(path.split("-")[1])
+            
+            resume_global_step = global_step * args.gradient_accumulation_steps
+            first_epoch = resume_global_step // len(train_dataloader)
+            resume_step = resume_global_step % len(train_dataloader)
+
     logger.info("***** Running training *****")
     logger.info(f"  Num examples = {len(train_dataset)}")
     logger.info(f"  Num Epochs = {args.num_train_epochs}")
     logger.info(f"  Total optimization steps = {args.max_train_steps}")
+    logger.info(f"  Resuming from step {global_step}")
 
-    global_step = 0
     progress_bar = tqdm(range(global_step, args.max_train_steps), disable=not accelerator.is_local_main_process)
     progress_bar.set_description("Steps")
 
-    for epoch in range(args.num_train_epochs):
-        unet.train() # Đặt unet ở chế độ train để các attention processor có thể hoạt động
+    for epoch in range(first_epoch, args.num_train_epochs):
+        unet.train()
         for step, batch in enumerate(train_dataloader):
+            # Bỏ qua các step đã train ở epoch hiện tại nếu resume
+            if args.resume_from_checkpoint and epoch == first_epoch and step < resume_step:
+                continue
+
             with accelerator.accumulate(unet):
-                # Chuyển ảnh thành latents
                 latents = vae.encode(batch["pixel_values"].to(dtype=weight_dtype)).latent_dist.sample()
                 latents = latents * vae.config.scaling_factor
-
-                # Thêm nhiễu vào latents
                 noise = torch.randn_like(latents)
                 bsz = latents.shape[0]
-
-                timesteps = torch.full((bsz,), noise_scheduler.config.num_train_timesteps - 1,
-                                       device=accelerator.device, dtype=torch.long)
+                timesteps = torch.full((bsz,), noise_scheduler.config.num_train_timesteps - 1, device=accelerator.device, dtype=torch.long)
                 noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
-
-                # Lấy text embeddings
-                prompt_ids = tokenizer(
-                    batch["prompts"], padding="max_length", max_length=tokenizer.model_max_length, truncation=True, return_tensors="pt"
-                ).input_ids.to(accelerator.device)
-
-                prompt_ids_2 = tokenizer_2(
-                    batch["prompts"], padding="max_length", max_length=tokenizer_2.model_max_length, truncation=True, return_tensors="pt"
-                ).input_ids.to(accelerator.device)
-
-                # --- SỬA LỖI LOGIC TẠO EMBEDDING CHO SDXL (Bản hoàn chỉnh) ---
                 
-                # 1. Lấy hidden_states (3D) từ cả hai text encoder.
+                prompt_ids = tokenizer(batch["prompts"], padding="max_length", max_length=tokenizer.model_max_length, truncation=True, return_tensors="pt").input_ids.to(accelerator.device)
+                prompt_ids_2 = tokenizer_2(batch["prompts"], padding="max_length", max_length=tokenizer_2.model_max_length, truncation=True, return_tensors="pt").input_ids.to(accelerator.device)
+                
                 prompt_embeds_1 = text_encoder(prompt_ids, return_dict=True)
-                
                 text_encoder_2_output = text_encoder_2(prompt_ids_2, return_dict=True)
                 prompt_embeds_2 = text_encoder_2_output.last_hidden_state
-                
-                # 2. Ghép (concatenate) hidden_states từ cả hai encoder lại với nhau dọc theo chiều cuối cùng.
-                # Shape sẽ từ (batch, 77, 768) và (batch, 77, 1280) -> (batch, 77, 2048)
                 encoder_hidden_states = torch.cat([prompt_embeds_1.last_hidden_state, prompt_embeds_2], dim=-1)
-                
-                # 3. Lấy pooled_prompt_embeds (2D) từ text encoder thứ hai.
                 pooled_prompt_embeds = text_encoder_2_output.text_embeds
-
-                # 4. Chuẩn bị các conditioning signals bổ sung.
-                add_time_ids = torch.tensor(
-                    [[args.resolution, args.resolution, 0, 0, args.resolution, args.resolution]],
-                    device=accelerator.device, dtype=encoder_hidden_states.dtype
-                ).repeat(bsz, 1)
-
+                
+                add_time_ids = torch.tensor([[args.resolution, args.resolution, 0, 0, args.resolution, args.resolution]], device=accelerator.device, dtype=encoder_hidden_states.dtype).repeat(bsz, 1)
                 added_cond_kwargs = {"text_embeds": pooled_prompt_embeds, "time_ids": add_time_ids}
-                # --- KẾT THÚC SỬA LỖI ---
-
-                # Dự đoán nhiễu
-                model_pred = unet(noisy_latents, timesteps, encoder_hidden_states,
-                                  added_cond_kwargs=added_cond_kwargs).sample
+                
+                model_pred = unet(noisy_latents, timesteps, encoder_hidden_states, added_cond_kwargs=added_cond_kwargs).sample
                 loss = f.mse_loss(model_pred.float(), noise.float(), reduction="mean")
-
+                
                 accelerator.backward(loss)
                 if accelerator.sync_gradients:
                     accelerator.clip_grad_norm_(lora_layers.parameters(), 1.0)
@@ -436,32 +421,25 @@ def main():
                 global_step += 1
                 accelerator.log({"loss": loss.detach().item()}, step=global_step)
 
+                if global_step % args.checkpointing_steps == 0:
+                    if accelerator.is_main_process:
+                        save_path = os.path.join(args.output_dir, f"checkpoint-{global_step}")
+                        accelerator.save_state(save_path)
+                        logger.info(f"Saved state to {save_path}")
+
             if global_step >= args.max_train_steps:
                 break
-        
         if global_step >= args.max_train_steps:
-                break
+            break
 
-
-    # --- Lưu LoRA weight ---
     accelerator.wait_for_everyone()
     if accelerator.is_main_process:
-        # Lấy state_dict từ các lora_layers đã được huấn luyện một cách an toàn
-        # Accelerator sẽ tự động gom các trọng số từ tất cả các tiến trình (nếu có)
         lora_state_dict = accelerator.get_state_dict(lora_layers)
-
-        # Tạo thư mục output nếu chưa tồn tại
         output_dir = Path(args.output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
-        
-        # Thêm import cần thiết để lưu file
         from safetensors.torch import save_file
-
-        # Lưu trọng số LoRA ra file, đây là định dạng tiêu chuẩn
         save_file(lora_state_dict, output_dir / "pytorch_lora_weights.safetensors")
-
         logger.info(f"LoRA weights saved successfully to {output_dir / 'pytorch_lora_weights.safetensors'}")
-
 
 if __name__ == "__main__":
     main()
