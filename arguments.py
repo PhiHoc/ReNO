@@ -163,5 +163,12 @@ def parse_args():
         help="Path to the .jsonl file containing the prompts."
     )
 
+    parser.add_argument(
+        "--no_reward",
+        action="store_true",
+        default=False,
+        help="Run in generation-only mode without reward optimization loop."
+    )
+
     args = parser.parse_args()
     return args

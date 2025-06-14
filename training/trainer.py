@@ -29,6 +29,7 @@ class LatentNoiseTrainer:
         save_all_images: bool = False,
         imageselect: bool = False,
         device: torch.device = torch.device("cuda"),
+        no_reward: bool = False
     ):
         self.reward_losses = reward_losses
         self.model = model
@@ -44,6 +45,7 @@ class LatentNoiseTrainer:
         self.imageselect = imageselect
         self.device = device
         self.preprocess_fn = clip_img_transform(224)
+        self.no_reward = no_reward
 
     def train(
         self,
@@ -61,6 +63,21 @@ class LatentNoiseTrainer:
         best_rewards = None
         best_latents = None
         latent_dim = math.prod(latents.shape[1:])
+
+        # Sample without Reward
+        if self.no_reward:
+            logging.info(f"Running in no-reward mode for prompt '{prompt}'. Generating one image.")
+            generator = torch.Generator("cuda").manual_seed(self.seed)
+            image_tensor = self.model.apply(
+                latents=latents,
+                prompt=prompt,
+                generator=generator,
+                num_inference_steps=self.n_inference_steps,
+            )
+            image_numpy = image_tensor.detach().cpu().permute(0, 2, 3, 1).float().numpy()
+            image_pil = DiffusionPipeline.numpy_to_pil(image_numpy)[0]
+
+            return image_pil, image_pil, {}, {}
         for iteration in range(self.n_iters):
             to_log = ""
             rewards = {}

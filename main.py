@@ -71,6 +71,7 @@ def main(args):
         grad_clip=args.grad_clip,
         log_metrics=args.task == "single" or not args.no_optim,
         imageselect=args.imageselect,
+        no_reward=args.no_reward,
     )
 
     # Create latents
